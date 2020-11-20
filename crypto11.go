@@ -258,6 +258,11 @@ type Config struct {
 	GCMIVLength int
 
 	GCMIVFromHSMControl GCMIVFromHSMConfig
+
+	// ExternalContext can be an external pkcs11.Ctx instance.
+	// It allows working with both this library and pkcs11. If it is non-nil, it
+	// will be used for all operations and it will never be initialized or finalized.
+	ExternalContext *pkcs11.Ctx
 }
 
 type GCMIVFromHSMConfig struct {
@@ -306,7 +311,11 @@ func Configure(config *Config) (*Context, error) {
 
 	instance := &Context{
 		cfg: config,
-		ctx: pkcs11.New(config.Path),
+	}
+	if config.ExternalContext == nil {
+		instance.ctx = pkcs11.New(config.Path)
+	} else {
+		instance.ctx = config.ExternalContext
 	}
 
 	if instance.ctx == nil {
@@ -319,7 +328,7 @@ func Configure(config *Config) (*Context, error) {
 	numExistingContexts := refCount[config.Path]
 
 	// Only Initialize if we are the first Context using the library
-	if numExistingContexts == 0 {
+	if numExistingContexts == 0 && config.ExternalContext == nil {
 		if err := instance.ctx.Initialize(); err != nil {
 			instance.ctx.Destroy()
 			return nil, errors.WithMessage(err, "failed to initialize PKCS#11 library")
@@ -327,15 +336,19 @@ func Configure(config *Config) (*Context, error) {
 	}
 	slots, err := instance.ctx.GetSlotList(true)
 	if err != nil {
-		_ = instance.ctx.Finalize()
-		instance.ctx.Destroy()
+		if config.ExternalContext == nil {
+			_ = instance.ctx.Finalize()
+			instance.ctx.Destroy()
+		}
 		return nil, errors.WithMessage(err, "failed to list PKCS#11 slots")
 	}
 
 	instance.slot, instance.token, err = instance.findToken(slots, config.TokenSerial, config.TokenLabel, config.SlotNumber)
 	if err != nil {
-		_ = instance.ctx.Finalize()
-		instance.ctx.Destroy()
+		if config.ExternalContext == nil {
+			_ = instance.ctx.Finalize()
+			instance.ctx.Destroy()
+		}
 		return nil, err
 	}
 
@@ -353,8 +366,10 @@ func Configure(config *Config) (*Context, error) {
 	// used to keep a connection alive to the token to ensure object handles and the log in status remain accessible.
 	instance.persistentSession, err = instance.ctx.OpenSession(instance.slot, pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
 	if err != nil {
-		_ = instance.ctx.Finalize()
-		instance.ctx.Destroy()
+		if config.ExternalContext == nil {
+			_ = instance.ctx.Finalize()
+			instance.ctx.Destroy()
+		}
 		return nil, errors.WithMessagef(err, "failed to create long term session")
 	}
 
@@ -367,8 +382,10 @@ func Configure(config *Config) (*Context, error) {
 			pErr, isP11Error := err.(pkcs11.Error)
 
 			if !isP11Error || pErr != pkcs11.CKR_USER_ALREADY_LOGGED_IN {
-				_ = instance.ctx.Finalize()
-				instance.ctx.Destroy()
+				if config.ExternalContext == nil {
+					_ = instance.ctx.Finalize()
+					instance.ctx.Destroy()
+				}
 				return nil, errors.WithMessagef(err, "failed to log into long term session")
 			}
 		}
@@ -458,13 +475,15 @@ func (c *Context) Close() error {
 	refCount[c.cfg.Path] = count - 1
 
 	// If we were the last Context, finalize the library
-	if count == 1 {
+	if count == 1 && c.cfg.ExternalContext == nil {
 		err := c.ctx.Finalize()
 		if err != nil {
 			return err
 		}
 	}
 
-	c.ctx.Destroy()
+	if c.cfg.ExternalContext == nil {
+		c.ctx.Destroy()
+	}
 	return nil
 }
